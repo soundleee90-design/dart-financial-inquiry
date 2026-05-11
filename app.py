@@ -11,7 +11,7 @@ import json
 import logging
 import traceback
 from dataclasses import dataclass, replace
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import pandas as pd
@@ -26,8 +26,8 @@ from dart_client import (
     dart_main_page_url,
     disclosure_list_for_fiscal_year,
     disclosure_parse_candidates,
-    fetch_disclosure_document_zip,
     fetch_fnltt_singl_acnt_all,
+    try_fetch_disclosure_attachment_bytes,
     load_api_key,
     search_corporations_from_df,
 )
@@ -233,12 +233,24 @@ def _lookup_via_dart_html(
     item_query: str,
     *,
     is_unlisted: bool,
+    progress: Callable[[str], None] | None = None,
+    debug_log: list[str] | None = None,
 ) -> FinancialLookupResult:
     """
     DART 공시 원문 HTML 파싱 폴백.
 
     비상장은 공시 종류·첨부 구조가 제각각이라, 후보 공시를 여러 건 순회한다.
+
+    우선순위: (2) DART 웹 HTML 표 → (3) 공시 첨부 원본. 첨부 단계 실패는 전체 조회를 중단하지 않는다.
     """
+    def _prog(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    def _dbg(msg: str) -> None:
+        if debug_log is not None:
+            debug_log.append(msg)
+
     discs = disclosure_list_for_fiscal_year(api_key, corp_code, str(bsns_year))
     if discs.empty:
         raise DartApiError("해당 기간 OpenDART 공시 목록이 비어 있습니다. 사업연도·제출 시기를 확인하세요.")
@@ -252,29 +264,53 @@ def _lookup_via_dart_html(
             if not rcept_no:
                 continue
 
-            from_zip = False
+            from_attachment = False
+            max_v = 88 if is_unlisted else 40
             try:
-                bundle = parse_disclosure_for_accounts(rcept_no)
+                bundle = parse_disclosure_for_accounts(rcept_no, max_viewer_urls=max_v)
                 flat = bundle_to_account_amount_frame(bundle)
             except DartNetworkError:
                 flat = pd.DataFrame()
                 bundle = None  # type: ignore[assignment]
             except Exception as e:  # noqa: BLE001
                 logger.warning("공시 %s HTML·표 병합 단계 스킵(다음 후보 시도): %s", rcept_no, e)
+                _dbg(f"HTML 표 병합 예외 rcept_no={rcept_no}: {e!r}")
                 flat = pd.DataFrame()
                 bundle = None  # type: ignore[assignment]
 
+            # (3) HTML 에 표가 없을 때만 첨부 원본 시도 — 실패해도 다음 공시로 진행
             if flat.empty:
-                try:
-                    zbytes = fetch_disclosure_document_zip(api_key, rcept_no)
-                    bundle = parse_tables_from_document_zip(zbytes)
-                    flat = bundle_to_account_amount_frame(bundle)
-                    from_zip = True
-                except (DartApiError, DartNetworkError):
-                    continue
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("공시 %s document ZIP 파싱 스킵: %s", rcept_no, e)
-                    continue
+                _prog("공시 첨부 원본을 추가로 확인합니다.")
+                zbytes = try_fetch_disclosure_attachment_bytes(api_key, rcept_no)
+                if not zbytes:
+                    logger.info("첨부 원본 없음·미지원 rcept_no=%s — HTML·다음 후보만 사용", rcept_no)
+                    _dbg(f"첨부 원본 미수신 rcept_no={rcept_no}")
+                else:
+                    try:
+                        bundle = parse_tables_from_document_zip(zbytes)
+                        flat = bundle_to_account_amount_frame(bundle)
+                        if flat.empty:
+                            logger.warning(
+                                "첨부파일 분석 결과 표 없음 rcept_no=%s — 다음 후보로 진행",
+                                rcept_no,
+                            )
+                            _dbg(f"첨부 파싱 후 표 없음 rcept_no={rcept_no}")
+                        else:
+                            from_attachment = True
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "첨부파일 분석 실패 rcept_no=%s — HTML·다음 후보로 진행: %s",
+                            rcept_no,
+                            e,
+                        )
+                        _dbg(f"첨부 파싱 예외 rcept_no={rcept_no}: {e!r}")
+                        flat = pd.DataFrame()
+                        bundle = None  # type: ignore[assignment]
+                if flat.empty:
+                    logger.info(
+                        "첨부파일 ZIP 파싱 실패, HTML 원문 기준으로 재시도합니다 (다음 공시 후보)."
+                    )
+                    _prog("첨부파일 분석은 실패했지만 다른 방식으로 재시도합니다.")
 
             if flat.empty:
                 continue
@@ -300,13 +336,13 @@ def _lookup_via_dart_html(
                 notes.append(html_basis_note)
             if is_unlisted:
                 notes.append("비상장 공시 원문 추출값입니다. 단위(원/천원 등)는 DART 원문을 반드시 대조하세요.")
-            if from_zip:
-                notes.append("웹 뷰어 대신 OpenDART document.xml 원본 ZIP 에서 표를 추출했습니다.")
+            if from_attachment:
+                notes.append("공시 첨부 파일에서 표를 추출했습니다. 금액 단위는 DART 원문과 반드시 대조하세요.")
             basis_note = " ".join(notes) if notes else None
 
             src_api = (
-                "OpenDART document.xml (ZIP) + pandas.read_html"
-                if from_zip
+                "DART 공시 첨부 원본 (표 추출)"
+                if from_attachment
                 else "DART 공시 원문 HTML (BeautifulSoup + pandas.read_html)"
             )
 
@@ -355,24 +391,27 @@ def _lookup_via_dart_html(
         if not rcept_no:
             continue
         try:
-            bundle = parse_disclosure_for_accounts(rcept_no)
+            bundle = parse_disclosure_for_accounts(rcept_no, max_viewer_urls=88 if is_unlisted else 40)
             flat = bundle_to_account_amount_frame(bundle)
         except DartNetworkError:
             flat = pd.DataFrame()
             bundle = None  # type: ignore[assignment]
         except Exception as e:  # noqa: BLE001
             logger.warning("공시 %s HTML·표 병합 단계 스킵(금액 미인식 루프): %s", rcept_no, e)
+            _dbg(f"[금액 미인식 루프] HTML 병합 예외 rcept_no={rcept_no}: {e!r}")
             flat = pd.DataFrame()
             bundle = None  # type: ignore[assignment]
         if flat.empty:
-            try:
-                zbytes = fetch_disclosure_document_zip(api_key, rcept_no)
-                bundle = parse_tables_from_document_zip(zbytes)
-                flat = bundle_to_account_amount_frame(bundle)
-            except (DartApiError, DartNetworkError):
-                continue
-            except Exception as e:  # noqa: BLE001
-                logger.warning("공시 %s ZIP 파싱 스킵(금액 미인식 루프): %s", rcept_no, e)
+            zbytes = try_fetch_disclosure_attachment_bytes(api_key, rcept_no)
+            if zbytes:
+                try:
+                    bundle = parse_tables_from_document_zip(zbytes)
+                    flat = bundle_to_account_amount_frame(bundle)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("공시 %s 첨부 파싱 스킵(금액 미인식 루프): %s", rcept_no, e)
+                    _dbg(f"[금액 미인식 루프] 첨부 파싱 예외 rcept_no={rcept_no}: {e!r}")
+                    continue
+            else:
                 continue
         if flat.empty:
             continue
@@ -395,11 +434,11 @@ def _lookup_via_dart_html(
             basis_note="비상장·스캔 PDF 등은 자동 인식이 어려울 수 있습니다." if is_unlisted else None,
         )
 
-    raise DartApiError(
-        "DART 웹·OpenDART 원본(ZIP) 모두에서 읽을 수 있는 재무 표를 찾지 못했습니다. "
-        "① 해당 사업연도 사업보고서가 아직 제출되지 않았거나, ② PDF/스캔만 공시된 경우 자동 조회가 불가할 수 있습니다. "
-        "사업연도를 한 해 낮춰 보거나 DART 사이트에서 직접 공시를 확인해 주세요."
+    _dbg(
+        "상세: 해당 사업연도 사업보고서 미제출, PDF/스캔만 공시, 또는 표 추출 불가 공시일 수 있습니다. "
+        "사업연도·DART 원문을 직접 확인하세요."
     )
+    raise DartApiError("DART 원문에서 해당 항목을 찾지 못했습니다.")
 
 
 def run_lookup_pipeline(
@@ -412,11 +451,18 @@ def run_lookup_pipeline(
     item_query: str,
     *,
     is_unlisted: bool = False,
+    progress: Callable[[str], None] | None = None,
+    debug_log: list[str] | None = None,
 ) -> FinancialLookupResult:
     """
     조회 파이프라인: OpenDART API 우선, 연결(CFS) 무응답 시 별도(OFS) API 재시도,
     그다음 DART HTML 폴백(비상장은 공시 후보를 여러 건 순회).
     """
+    def _prog(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    _prog("OpenDART 재무 API를 조회합니다.")
     try:
         primary = _lookup_via_opendart(
             api_key,
@@ -466,6 +512,7 @@ def run_lookup_pipeline(
     if primary is not None and primary.matched_account not in ("(매칭 실패)", "(금액 미인식)"):
         return primary
 
+    _prog("API에서 직접 조회되지 않아 DART 원문을 확인 중입니다.")
     try:
         return _lookup_via_dart_html(
             api_key,
@@ -475,6 +522,8 @@ def run_lookup_pipeline(
             fs_div=fs_div,
             item_query=item_query,
             is_unlisted=is_unlisted,
+            progress=progress,
+            debug_log=debug_log,
         )
     except (DartApiError, DartNetworkError):
         if primary is not None:
@@ -644,7 +693,7 @@ DART_API_KEY = "여기에_발급받은_키"
             st.error("사업연도는 숫자 4자리로 입력하세요.")
         else:
             with st.status("재무 데이터 조회 중…", expanded=True) as status:
-                status.write("OpenDART 및 DART 원문을 확인하는 중입니다.")
+                lookup_debug: list[str] = []
                 try:
                     stock = (sel.stock_code or "").strip()
                     unlisted = (not stock) or stock == "000000"
@@ -659,24 +708,36 @@ DART_API_KEY = "여기에_발급받은_키"
                         reprt_code=reprt_val,
                         item_query=item_query.strip(),
                         is_unlisted=unlisted,
+                        progress=status.write,
+                        debug_log=lookup_debug,
                     )
                     st.session_state.last_lookup = res
+                    st.session_state.last_lookup_debug = lookup_debug
                     status.update(label="조회 완료", state="complete", expanded=False)
                     _push_recent_corp(sel)
                 except DartApiError as e:
                     status.update(label="조회 실패", state="error")
+                    st.session_state.last_lookup_debug = lookup_debug
                     st.error(str(e))
+                    with st.expander("기술 상세 (개발자용)"):
+                        if lookup_debug:
+                            st.code("\n".join(lookup_debug), language="text")
                 except DartNetworkError:
                     status.update(label="네트워크 오류", state="error")
                     st.error("네트워크 연결을 확인한 뒤 잠시 후 다시 시도해 주세요.")
-                    with st.expander("기술 상세"):
+                    with st.expander("기술 상세 (개발자용)"):
                         st.code(traceback.format_exc(), language="text")
+                        if lookup_debug:
+                            st.code("\n".join(lookup_debug), language="text")
                 except Exception as e:  # noqa: BLE001
                     status.update(label="오류", state="error")
+                    st.session_state.last_lookup_debug = lookup_debug
                     st.error(
                         "조회 중 문제가 발생했습니다. 기업명·사업연도·조회 항목을 확인한 뒤 다시 시도해 주세요."
                     )
                     with st.expander("기술 상세 (개발자용)"):
+                        if lookup_debug:
+                            st.code("\n".join(lookup_debug), language="text")
                         st.code(traceback.format_exc(), language="text")
                         st.caption(repr(e))
 

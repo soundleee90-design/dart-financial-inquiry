@@ -6,6 +6,7 @@ UI(Streamlit)와 분리된 순수 클라이언트 계층.
 from __future__ import annotations
 
 import io
+import logging
 import os
 import tempfile
 import time
@@ -21,6 +22,8 @@ from rapidfuzz import fuzz, process
 
 OPEN_DART_BASE = "https://opendart.fss.or.kr/api"
 DART_WEB_BASE = "https://dart.fss.or.kr"
+
+logger = logging.getLogger(__name__)
 
 # 이 프로젝트(app.py, 본 모듈 등)가 있는 디렉터리 — Streamlit 실행 시 CWD와 무관하게 .env 를 찾기 위함
 _PROJECT_DIR = Path(__file__).resolve().parent
@@ -451,17 +454,18 @@ def disclosure_list_for_fiscal_year(
     return out
 
 
-def fetch_disclosure_document_zip(api_key: str, rcept_no: str) -> bytes:
+def try_fetch_disclosure_attachment_bytes(api_key: str, rcept_no: str) -> bytes | None:
     """
-    공시서류 원본 파일 OpenDART document.xml API — ZIP 바이너리를 반환한다.
+    OpenDART document.xml 로 공시 첨부 원본을 내려받는다.
 
-    일부 비상장 공시는 DART 웹 viewer 에 표가 없고, 원본 ZIP 안의 HTML/XML 에만 표가 있는 경우가 있다.
+    실패해도 예외를 던지지 않고 None 을 반환한다 (HTML 폴밄 등 다른 경로 유지).
     """
     if not api_key:
-        raise DartApiError("DART_API_KEY가 설정되어 있지 않습니다.")
+        logger.warning("첨부 다운로드 생략: API 키 없음")
+        return None
     rid = str(rcept_no).strip()
     if not rid:
-        raise DartApiError("rcept_no 가 비어 있습니다.")
+        return None
 
     url = f"{OPEN_DART_BASE}/document.xml"
     params = {"crtfc_key": api_key, "rcept_no": rid}
@@ -470,25 +474,60 @@ def fetch_disclosure_document_zip(api_key: str, rcept_no: str) -> bytes:
             r = sess.get(url, params=params, timeout=180)
             r.raise_for_status()
             data = r.content
+    except requests.Timeout as e:
+        logger.warning("첨부 원본 요청 시간 초과 rcept_no=%s: %s", rid, e)
+        return None
     except requests.RequestException as e:
-        raise DartNetworkError(f"document.xml 다운로드 실패: {e}") from e
+        logger.warning("첨부 원본 요청 실패 rcept_no=%s: %s", rid, e)
+        return None
+    except PermissionError as e:
+        logger.warning("첨부 원본 응답 권한 오류 rcept_no=%s: %s", rid, e)
+        return None
+    except OSError as e:
+        logger.warning("첨부 원본 응답 처리 실패 rcept_no=%s: %s", rid, e)
+        return None
 
     if len(data) >= 4 and data[:2] == b"PK":
         return data
 
-    # ZIP 이 아니면 JSON/XML 오류 메시지일 수 있음
     try:
-        err = data.decode("utf-8", errors="ignore")[:500]
-    except Exception:
-        err = ""
-    if b"<?xml" in data[:200] or b"<html" in data[:200].lower():
-        if "message" in err.lower() or "status" in err.lower():
-            pass
-    raise DartApiError(
-        "OpenDART document.xml 이 ZIP 원본을 반환하지 않았습니다. "
-        "해당 공시가 원본 다운로드 미지원이거나, 오류 응답일 수 있습니다. "
-        f"(응답 앞부분: {err[:200]!r})"
+        peek = data.decode("utf-8", errors="ignore")[:400]
+    except UnicodeDecodeError:
+        peek = repr(data[:120])
+    logger.info(
+        "첨부 응답이 압축 원본이 아님 rcept_no=%s head=%s",
+        rid,
+        peek.replace("\n", " ")[:200],
     )
+    return None
+
+
+def fetch_disclosure_document_zip(api_key: str, rcept_no: str) -> bytes:
+    """
+    공시 첨부 원본 바이너리를 반환한다. 실패 시 DartApiError.
+
+    UI 폴백에서는 try_fetch_disclosure_attachment_bytes 가 더 안전하다.
+    """
+    data = try_fetch_disclosure_attachment_bytes(api_key, rcept_no)
+    if data is None:
+        raise DartApiError(
+            "공시 첨부 원본을 가져오지 못했습니다. 해당 공시가 원본 미지원이거나 일시 오류일 수 있습니다."
+        )
+    return data
+
+
+def disclosure_attachment_workdir() -> Path:
+    """
+    첨부 압축을 임시로 풀 때 사용할 쓰기 가능 디렉터리 (Streamlit Cloud 등).
+
+    DART_ATTACHMENT_TMP 환경변수로 덮어쓸 수 있다.
+    """
+    override = (os.getenv("DART_ATTACHMENT_TMP") or "").strip()
+    if override:
+        p = Path(override)
+        p.mkdir(parents=True, exist_ok=True)
+        return p
+    return Path(tempfile.gettempdir())
 
 
 def disclosure_parse_candidates(

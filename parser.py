@@ -10,10 +10,14 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 import re
+import shutil
+import tempfile
 import warnings
 import zipfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 
@@ -21,7 +25,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from dart_client import DART_WEB_BASE, DartApiError, DartNetworkError, _session
+from dart_client import DART_WEB_BASE, DartNetworkError, disclosure_attachment_workdir, _session
 from utils import safe_str
 
 _log = logging.getLogger(__name__)
@@ -75,6 +79,24 @@ def extract_viewer_urls_from_main_html(html: str, rcp_no: str) -> list[str]:
 
     for m in re.finditer(r"https?://dart\.fss\.or\.kr[^\s\"'<>]+viewer\.do[^\s\"'<>]*", html):
         add(m.group(0))
+    for m in re.finditer(r"https?://dart\.fss\.or\.kr[^\s\"'<>]+view\.do[^\s\"'<>]*", html):
+        add(m.group(0))
+    for m in re.finditer(r"https?://mdart\.fss\.or\.kr[^\s\"'<>]+", html):
+        u = m.group(0).rstrip(").,;\"'")
+        if "viewer" in u or "view" in u or "report" in u:
+            add(u)
+
+    for a in soup.find_all("a", href=True):
+        href = str(a.get("href") or "").strip()
+        if not href:
+            continue
+        if "viewer.do" in href or "view.do" in href or "/report/" in href:
+            if href.startswith("//"):
+                href = "https:" + href
+            elif href.startswith("/"):
+                href = DART_WEB_BASE + href
+            if "dart.fss.or.kr" in href or "mdart.fss.or.kr" in href:
+                add(href)
 
     # dcmNo / dcm_id 등 스크립트·JSON 에 산재한 패턴
     dcm_nos: set[str] = set()
@@ -289,6 +311,54 @@ def _read_html_tables(html_fragment: str) -> list[pd.DataFrame]:
                 return []
 
 
+def _open_zip_from_bytes(data: bytes) -> zipfile.ZipFile | None:
+    """ZIP 바이트를 연다. 메타데이터 인코딩·BadZipFile 은 소프트 실패."""
+    if not data or len(data) < 4 or data[:2] != b"PK":
+        return None
+    for kwargs in (
+        {"metadata_encoding": "utf-8"},
+        {"metadata_encoding": "cp949"},
+        {},
+    ):
+        try:
+            return zipfile.ZipFile(io.BytesIO(data), **kwargs)
+        except TypeError:
+            continue
+        except zipfile.BadZipFile:
+            return None
+    return None
+
+
+def _harvest_tables_from_zip_extracted_dir(root: str, label_prefix: str) -> list[pd.DataFrame]:
+    """extractall 로 푼 디렉터리에서 HTML/XML 만 표 수집."""
+    out: list[pd.DataFrame] = []
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            low = fn.lower()
+            if low.endswith(".pdf") or low.endswith(".png") or low.endswith(".jpg"):
+                continue
+            if not any(low.endswith(ext) for ext in (".htm", ".html", ".xml", ".xhtml")):
+                continue
+            path = os.path.join(dirpath, fn)
+            try:
+                raw = Path(path).read_bytes()
+            except (OSError, PermissionError, FileNotFoundError) as e:
+                _log.debug("첨부 파일 읽기 스킵 %s: %s", path, e)
+                continue
+            text: str | None = None
+            for enc in ("utf-8", "utf-8-sig", "cp949", "euc-kr", "latin-1"):
+                try:
+                    text = raw.decode(enc)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if not text:
+                continue
+            rel = os.path.relpath(path, root)
+            out.extend(harvest_tables_from_html(text, f"{label_prefix}:{rel}"))
+    return out
+
+
 def harvest_tables_from_html(html: str, base_url: str) -> list[pd.DataFrame]:
     """
     HTML 문자열에서 pandas.read_html로 표를 모두 읽는다.
@@ -320,6 +390,7 @@ def parse_disclosure_for_accounts(
     rcp_no: str,
     *,
     prefer_keywords: Iterable[str] = ("연결손익", "연결재무상태", "손익계산서", "재무상태표", "포괄손익"),
+    max_viewer_urls: int = 40,
 ) -> ParsedTableBundle:
     """
     공시 접수번호(rcp_no) 기준으로 DART 본문을 따라가며 재무표 후보를 수집한다.
@@ -331,7 +402,8 @@ def parse_disclosure_for_accounts(
     collected: list[pd.DataFrame] = []
     used_url = main_url
 
-    for vurl in viewer_urls[:40]:
+    cap = max(8, min(max_viewer_urls, 120))
+    for vurl in viewer_urls[:cap]:
         used_url = vurl
         try:
             vhtml = _fetch_text(vurl)
@@ -339,8 +411,12 @@ def parse_disclosure_for_accounts(
             continue
         collected.extend(harvest_tables_from_html(vhtml, vurl))
 
+    main_tables = harvest_tables_from_html(main_html, main_url)
     if not collected:
-        collected.extend(harvest_tables_from_html(main_html, main_url))
+        collected = main_tables
+    else:
+        # 본문 main.do 에만 있는 표(뷰어 URL 누락·비상장 멀티첨부 대비)
+        collected.extend(main_tables)
 
     financial_like: list[pd.DataFrame] = []
     for ti, t in enumerate(collected):
@@ -367,54 +443,99 @@ def parse_disclosure_for_accounts(
 
 def parse_tables_from_document_zip(zip_bytes: bytes) -> ParsedTableBundle:
     """
-    OpenDART document.xml 로 받은 ZIP 안의 HTML/XML 에서 표를 추출한다.
+    공시 첨부 원본(ZIP) 안의 HTML/XML 에서 표를 추출한다.
 
-    비상장 감사보고서 등은 DART 웹 뷰어에 테이블이 없고, ZIP 내 *.htm/*.xml 에만 있는 경우가 있다.
+    형식 오류·인코딩·파일명 문제는 로그만 남기고 빈 결과를 반환하며 예외를 던지지 않는다.
     """
     collected: list[pd.DataFrame] = []
     names_seen: list[str] = []
 
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    except zipfile.BadZipFile as e:
-        raise DartApiError(f"document ZIP 형식이 아닙니다: {e}") from e
+    zf = _open_zip_from_bytes(zip_bytes)
+    if zf is None:
+        _log.info("첨부 압축을 열 수 없습니다 — HTML 등 다른 경로만 사용합니다.")
+        return ParsedTableBundle(
+            source_url="공시 첨부 원본",
+            disclosure_title_hint="attachment",
+            tables=[],
+        )
 
-    with zf:
-        for name in zf.namelist():
-            low = name.lower()
-            if low.endswith(".pdf") or low.endswith(".png") or low.endswith(".jpg"):
-                continue
-            if not any(low.endswith(ext) for ext in (".htm", ".html", ".xml", ".xhtml")):
-                continue
+    def decode_and_collect(raw: bytes, logical_name: str) -> None:
+        text: str | None = None
+        for enc in ("utf-8", "utf-8-sig", "cp949", "euc-kr", "latin-1"):
             try:
-                raw = zf.read(name)
-            except Exception:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
                 continue
-            text: str | None = None
-            for enc in ("utf-8", "utf-8-sig", "cp949", "euc-kr", "latin-1"):
-                try:
-                    text = raw.decode(enc)
-                    break
-                except UnicodeDecodeError:
-                    continue
-            if not text:
-                continue
-            names_seen.append(name)
-            collected.extend(harvest_tables_from_html(text, name))
+        if not text:
+            return
+        names_seen.append(logical_name)
+        collected.extend(harvest_tables_from_html(text, logical_name))
 
-    financial_like = []
+    try:
+        with zf:
+            try:
+                infos = zf.infolist()
+            except Exception as e:
+                _log.warning("첨부 목록 읽기 실패: %s", e)
+                infos = []
+            for info in infos:
+                if info.is_dir():
+                    continue
+                try:
+                    name = str(info.filename)
+                except Exception:
+                    continue
+                low = name.lower()
+                if low.endswith(".pdf") or low.endswith(".png") or low.endswith(".jpg"):
+                    continue
+                if not any(low.endswith(ext) for ext in (".htm", ".html", ".xml", ".xhtml")):
+                    continue
+                try:
+                    raw = zf.read(info)
+                except (OSError, PermissionError, zipfile.BadZipFile, RuntimeError) as e:
+                    _log.debug("첨부 멤버 읽기 스킵 %s: %s", name, e)
+                    continue
+                decode_and_collect(raw, name)
+    except zipfile.BadZipFile as e:
+        _log.warning("첨부 압축 손상: %s", e)
+    except Exception as e:
+        _log.warning("첨부 압축 순회 실패: %s", e)
+
+    if not collected and zip_bytes:
+        work_root = disclosure_attachment_workdir()
+        try:
+            tmp = tempfile.mkdtemp(prefix="dart_att_", dir=str(work_root))
+        except (OSError, PermissionError) as e:
+            _log.warning("임시 폴더 생성 실패: %s", e)
+            tmp = None
+        if tmp:
+            try:
+                zf2 = _open_zip_from_bytes(zip_bytes)
+                if zf2 is not None:
+                    with zf2:
+                        try:
+                            zf2.extractall(tmp)
+                        except (OSError, PermissionError, zipfile.BadZipFile, RuntimeError) as e:
+                            _log.warning("첨부 압축 해제 실패(임시 경로): %s", e)
+                        else:
+                            collected.extend(_harvest_tables_from_zip_extracted_dir(tmp, "attachment"))
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+    financial_like: list[pd.DataFrame] = []
     for ti, t in enumerate(collected):
         try:
             if _table_looks_financial(t):
                 financial_like.append(t)
         except Exception as e:
-            _log.warning("ZIP 표 재무 판별 스킵 #%s: %s", ti, e)
+            _log.warning("첨부 표 재무 판별 스킵 #%s: %s", ti, e)
             continue
     tables = financial_like or collected
-    hint = ",".join(names_seen[:3]) if names_seen else "zip"
+    hint = ",".join(names_seen[:3]) if names_seen else "attachment"
     return ParsedTableBundle(
-        source_url=f"OpenDART document.xml (ZIP 내부: {hint})",
-        disclosure_title_hint="document_zip",
+        source_url=f"공시 첨부 원본 ({hint})",
+        disclosure_title_hint="attachment",
         tables=tables,
     )
 

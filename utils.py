@@ -5,10 +5,42 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Any, Literal
+
+import pandas as pd
 
 # 연결(CFS) / 별도(OFS) 한글 표기
 FsDivLabel = Literal["연결", "별도"]
+
+
+def safe_str(value: Any, *, empty: str = "") -> str:
+    """
+    NaN / None / float / int 등을 regex·rapidfuzz·strip 전에 안전하게 문자열로 바꾼다.
+
+    pandas 셀, read_html 결과 등에 섞인 비문자 값으로 인한 예외를 막는다.
+    """
+    if value is None:
+        return empty
+    try:
+        if pd.isna(value):
+            return empty
+    except Exception:
+        pass
+    if isinstance(value, float):
+        if value != value:  # NaN
+            return empty
+        if abs(value - round(value)) < 1e-9 and abs(value) < 1e15:
+            return str(int(round(value)))
+        return str(value).strip()
+    if isinstance(value, int):
+        return str(value)
+    s = str(value).strip()
+    if not s:
+        return empty
+    low = s.lower()
+    if low in ("nan", "none", "<na>", "nat", "null"):
+        return empty
+    return s
 
 
 def fs_div_to_label(fs_div: str) -> FsDivLabel:
@@ -29,8 +61,8 @@ def parse_amount_won(value: str | int | float | None) -> int | None:
         if isinstance(value, float) and value != value:  # NaN
             return None
         return int(value)
-    s = str(value).strip()
-    if not s or s in ("-", "—", "N/A", "nan"):
+    s = safe_str(value)
+    if not s or s in ("-", "—", "N/A"):
         return None
     negative = False
     if s.startswith("(") and s.endswith(")"):
@@ -81,8 +113,10 @@ def build_report_sentence(
     보고자료에 바로 붙여넣을 수 있는 한 문장 형태의 요약 문자열을 만든다.
     억 단위가 있으면 억 원 중심, 없으면 원 단위를 괄호로 보조 표기한다.
     """
-    year = str(bsns_year).strip()
-    base = f"{company_name}의 {year}년 {fs_label} 기준 {account_matched}은(는) "
+    year = safe_str(bsns_year) or "-"
+    cn = safe_str(company_name) or "해당 기업"
+    acc = safe_str(account_matched) or "해당 계정"
+    base = f"{cn}의 {year}년 {fs_label} 기준 {acc}은(는) "
     if eok is not None:
         base += format_eok_sentence(eok)
         if won is not None:
@@ -92,4 +126,4 @@ def build_report_sentence(
     if won is not None:
         base += f"약 {format_won_commas(won)}원입니다."
         return base
-    return f"{company_name}의 {year}년 {fs_label} 기준 {account_matched} 금액을 확인하지 못했습니다."
+    return f"{cn}의 {year}년 {fs_label} 기준 {acc} 금액을 확인하지 못했습니다."

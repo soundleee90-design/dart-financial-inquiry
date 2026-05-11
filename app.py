@@ -8,6 +8,8 @@ API/파싱 로직은 dart_client, matcher, parser, utils 모듈에 두고,
 from __future__ import annotations
 
 import json
+import logging
+import traceback
 from dataclasses import dataclass, replace
 from collections.abc import Sequence
 from typing import Any
@@ -31,8 +33,17 @@ from dart_client import (
 )
 from matcher import AccountMatch, attach_best_match_to_dataframe, best_account_match
 from parser import bundle_to_account_amount_frame, parse_disclosure_for_accounts, parse_tables_from_document_zip
-from utils import build_report_sentence, format_eok_sentence, format_won_commas, fs_div_to_label, parse_amount_won, won_to_eok
+from utils import (
+    build_report_sentence,
+    format_eok_sentence,
+    format_won_commas,
+    fs_div_to_label,
+    parse_amount_won,
+    safe_str,
+    won_to_eok,
+)
 
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------------
 # Streamlit 페이지 설정 (모바일·Cloud 친화: centered)
@@ -248,6 +259,10 @@ def _lookup_via_dart_html(
             except DartNetworkError:
                 flat = pd.DataFrame()
                 bundle = None  # type: ignore[assignment]
+            except Exception as e:  # noqa: BLE001
+                logger.warning("공시 %s HTML·표 병합 단계 스킵(다음 후보 시도): %s", rcept_no, e)
+                flat = pd.DataFrame()
+                bundle = None  # type: ignore[assignment]
 
             if flat.empty:
                 try:
@@ -257,6 +272,9 @@ def _lookup_via_dart_html(
                     from_zip = True
                 except (DartApiError, DartNetworkError):
                     continue
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("공시 %s document ZIP 파싱 스킵: %s", rcept_no, e)
+                    continue
 
             if flat.empty:
                 continue
@@ -265,7 +283,7 @@ def _lookup_via_dart_html(
                 continue
             best = cands[0]
             amt_raw = flat.iloc[best.row_index]["amount_raw"]
-            won = parse_amount_won(str(amt_raw))
+            won = parse_amount_won(safe_str(amt_raw))
             if won is None:
                 continue
 
@@ -342,12 +360,19 @@ def _lookup_via_dart_html(
         except DartNetworkError:
             flat = pd.DataFrame()
             bundle = None  # type: ignore[assignment]
+        except Exception as e:  # noqa: BLE001
+            logger.warning("공시 %s HTML·표 병합 단계 스킵(금액 미인식 루프): %s", rcept_no, e)
+            flat = pd.DataFrame()
+            bundle = None  # type: ignore[assignment]
         if flat.empty:
             try:
                 zbytes = fetch_disclosure_document_zip(api_key, rcept_no)
                 bundle = parse_tables_from_document_zip(zbytes)
                 flat = bundle_to_account_amount_frame(bundle)
             except (DartApiError, DartNetworkError):
+                continue
+            except Exception as e:  # noqa: BLE001
+                logger.warning("공시 %s ZIP 파싱 스킵(금액 미인식 루프): %s", rcept_no, e)
                 continue
         if flat.empty:
             continue
@@ -455,6 +480,14 @@ def run_lookup_pipeline(
         if primary is not None:
             return primary
         raise
+    except Exception:  # noqa: BLE001
+        logger.exception("DART 원문 폴백 중 예기치 않은 오류")
+        if primary is not None:
+            return primary
+        raise DartApiError(
+            "DART 원문에서 재무를 읽는 중 오류가 발생했습니다. "
+            "사업연도·공시 제출 여부를 확인하거나 잠시 후 다시 시도해 주세요."
+        ) from None
 
 
 def _render_copy_button(sentence: str) -> None:
@@ -632,13 +665,20 @@ DART_API_KEY = "여기에_발급받은_키"
                     _push_recent_corp(sel)
                 except DartApiError as e:
                     status.update(label="조회 실패", state="error")
-                    st.error(f"처리 오류: {e}")
-                except DartNetworkError as e:
+                    st.error(str(e))
+                except DartNetworkError:
                     status.update(label="네트워크 오류", state="error")
-                    st.error(f"네트워크: {e}")
+                    st.error("네트워크 연결을 확인한 뒤 잠시 후 다시 시도해 주세요.")
+                    with st.expander("기술 상세"):
+                        st.code(traceback.format_exc(), language="text")
                 except Exception as e:  # noqa: BLE001
                     status.update(label="오류", state="error")
-                    st.error(f"알 수 없는 오류: {e}")
+                    st.error(
+                        "조회 중 문제가 발생했습니다. 기업명·사업연도·조회 항목을 확인한 뒤 다시 시도해 주세요."
+                    )
+                    with st.expander("기술 상세 (개발자용)"):
+                        st.code(traceback.format_exc(), language="text")
+                        st.caption(repr(e))
 
     res = st.session_state.last_lookup
     if isinstance(res, FinancialLookupResult):

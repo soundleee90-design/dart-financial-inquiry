@@ -9,6 +9,7 @@ dcmNo 후보를 넓게 모으고 금액 열을 휴리스틱으로 고른다.
 from __future__ import annotations
 
 import io
+import logging
 import re
 import warnings
 import zipfile
@@ -21,6 +22,9 @@ import requests
 from bs4 import BeautifulSoup
 
 from dart_client import DART_WEB_BASE, DartApiError, DartNetworkError, _session
+from utils import safe_str
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -92,72 +96,124 @@ def extract_viewer_urls_from_main_html(html: str, rcp_no: str) -> list[str]:
     return urls
 
 
-def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """열 이름을 문자열로 정리한다."""
+def _dedupe_column_names(names: list[str]) -> list[str]:
+    """중복 열 이름을 뒤에 번호를 붙여 유일하게 만든다."""
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for raw in names:
+        base = (raw or "col").strip() or "col"
+        n = seen.get(base, 0)
+        if n == 0:
+            out.append(base)
+        else:
+            out.append(f"{base}_{n}")
+        seen[base] = n + 1
+    return out
+
+
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """MultiIndex·튜플·비문자 열 이름을 한 줄 문자열로 평탄화한다."""
     df = df.copy()
-    df.columns = [str(c).strip().replace("\n", " ") for c in df.columns]
+    cols = df.columns
+    if isinstance(cols, pd.MultiIndex):
+        flat: list[str] = []
+        for tup in cols:
+            parts = [safe_str(x) for x in tup if safe_str(x)]
+            flat.append(" ".join(parts).strip() or "col")
+        df.columns = _dedupe_column_names(flat)
+    else:
+        flat = [safe_str(c).replace("\n", " ") or f"col_{i}" for i, c in enumerate(cols)]
+        df.columns = _dedupe_column_names(flat)
     return df
+
+
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """열 이름을 문자열로 정리한다(MultiIndex·NaN 열명 대응)."""
+    try:
+        return _flatten_columns(df)
+    except Exception as e:
+        _log.warning("열 이름 정규화 실패: %s", e)
+        df = df.copy()
+        df.columns = [safe_str(c).replace("\n", " ") or f"col_{i}" for i, c in enumerate(df.columns)]
+        return df
 
 
 def _column_digit_ratio(series: pd.Series, sample: int = 50) -> float:
     """열 값에 숫자(금액) 형태가 얼마나 등장하는지 0~1."""
-    s = series.head(sample).astype(str)
-    if s.empty:
-        return 0.0
     pat = re.compile(r"[\d,\.\(\)]+")
-    hits = sum(1 for x in s if pat.search(x) and len(re.sub(r"[^\d]", "", x)) >= 3)
-    return hits / len(s)
+    hits = 0
+    n = 0
+    for x in series.head(sample):
+        sx = safe_str(x)
+        if not sx:
+            continue
+        n += 1
+        digits = re.sub(r"[^\d]", "", sx)
+        if pat.search(sx) and len(digits) >= 3:
+            hits += 1
+    return hits / max(n, 1)
 
 
 def _pick_account_and_amount_columns(df: pd.DataFrame) -> tuple[str, str] | None:
     """
     첫 열·금액 열을 추론한다. 비상장 표는 '당기'·'제n기' 등 열 이름이 제각각이다.
     """
-    df = _normalize_columns(df)
-    if df.shape[1] < 2 or df.shape[0] < 2:
-        return None
+    try:
+        df = _normalize_columns(df)
+        if df.shape[1] < 2 or df.shape[0] < 2:
+            return None
 
-    cols = list(df.columns)
-    name_hints = ("과", "목", "계정", "항", "자산", "부채", "자본", "매출", "이익", "손실", "내역", "주석")
+        cols = list(df.columns)
 
-    # 금액 후보 열: 이름 힌트 또는 숫자 비율
-    best_col = cols[-1]
-    best_score = -1.0
-    for j, c in enumerate(cols):
-        cs = str(c)
-        hint = 0.0
-        if any(k in cs for k in ("당기", "금액", "합계", "기간", "제", "분기", "반기")):
-            hint = 2.0
-        ratio = _column_digit_ratio(df[c])
-        score = hint + ratio * 3.0 + (0.1 * j / max(len(cols), 1))  # 동점이면 오른쪽 선호
-        if score > best_score:
-            best_score = score
-            best_col = c
-
-    if best_score < 0.35 and len(cols) >= 2:
-        # 휴리스틱 실패 시 맨 오른쪽 열
+        # 금액 후보 열: 이름 힌트 또는 숫자 비율
         best_col = cols[-1]
+        best_score = -1.0
+        for j, c in enumerate(cols):
+            cs = safe_str(c)
+            hint = 0.0
+            if any(k in cs for k in ("당기", "금액", "합계", "기간", "제", "분기", "반기")):
+                hint = 2.0
+            ratio = _column_digit_ratio(df[c])
+            score = hint + ratio * 3.0 + (0.1 * j / max(len(cols), 1))  # 동점이면 오른쪽 선호
+            if score > best_score:
+                best_score = score
+                best_col = c
 
-    # 계정명: 첫 열 또는 텍스트 비율이 높은 왼쪽 열
-    account_col = cols[0]
-    if len(cols) >= 3:
-        for c in cols[:-1]:
-            if c == best_col:
-                continue
-            txt_ratio = 1.0 - min(1.0, _column_digit_ratio(df[c]))
-            if txt_ratio > 0.55:
-                account_col = c
-                break
+        if best_score < 0.35 and len(cols) >= 2:
+            # 휴리스틱 실패 시 맨 오른쪽 열
+            best_col = cols[-1]
 
-    return account_col, best_col
+        # 계정명: 첫 열 또는 텍스트 비율이 높은 왼쪽 열
+        account_col = cols[0]
+        if len(cols) >= 3:
+            for c in cols[:-1]:
+                if c == best_col:
+                    continue
+                txt_ratio = 1.0 - min(1.0, _column_digit_ratio(df[c]))
+                if txt_ratio > 0.55:
+                    account_col = c
+                    break
+
+        return account_col, best_col
+    except Exception as e:
+        _log.warning("_pick_account_and_amount_columns 실패: %s", e)
+        return None
 
 
 def _table_looks_financial(df: pd.DataFrame) -> bool:
     """연결손익/재무상태표 류 표인지 휴리스틱으로 판별 (비상장 단순 표 포함)."""
     if df.shape[1] < 2 or df.shape[0] < 2:
         return False
-    cols = " ".join(df.columns.astype(str))
-    joined = cols + " " + df.head(40).to_string()
+    col_parts = [safe_str(c) for c in df.columns]
+    cols = " ".join(col_parts)
+    cell_parts: list[str] = []
+    try:
+        for _, row in df.head(40).iterrows():
+            for v in row.values:
+                cell_parts.append(safe_str(v))
+    except Exception:
+        pass
+    joined = cols + " " + " ".join(cell_parts)
     keys = (
         "계정",
         "과목",
@@ -176,6 +232,8 @@ def _table_looks_financial(df: pd.DataFrame) -> bool:
         "원",
         "천원",
         "주석",
+        "영업수익",
+        "수익매출",
     )
     if any(k in joined for k in keys):
         return True
@@ -191,20 +249,30 @@ def _longify_financial_table(df: pd.DataFrame) -> pd.DataFrame:
     """
     다양한 형태의 공시 표를 (account_nm, amount_raw) 형태로 단순화 시도한다.
     """
-    picked = _pick_account_and_amount_columns(df)
-    if picked is None:
+    try:
+        picked = _pick_account_and_amount_columns(df)
+        if picked is None:
+            return pd.DataFrame(columns=["account_nm", "amount_raw"])
+        account_col, value_col = picked
+        out_rows: list[dict[str, str]] = []
+        for _, row in df.iterrows():
+            try:
+                raw_name = row.get(account_col, "")
+                if pd.isna(raw_name):
+                    continue
+                name = safe_str(raw_name)
+                if not name or len(name) > 200:
+                    continue
+                raw_amt = row.get(value_col, "")
+                amt = safe_str(raw_amt)
+                out_rows.append({"account_nm": name, "amount_raw": amt})
+            except Exception as e:
+                _log.debug("행 스킵: %s", e)
+                continue
+        return pd.DataFrame(out_rows)
+    except Exception as e:
+        _log.warning("_longify_financial_table 실패: %s", e)
         return pd.DataFrame(columns=["account_nm", "amount_raw"])
-    account_col, value_col = picked
-    out_rows: list[dict[str, str]] = []
-    for _, row in df.iterrows():
-        name = str(row.get(account_col, "")).strip()
-        if not name or name.lower() == "nan":
-            continue
-        if len(name) > 200:
-            continue
-        amt = row.get(value_col, "")
-        out_rows.append({"account_nm": name, "amount_raw": str(amt)})
-    return pd.DataFrame(out_rows)
 
 
 def _read_html_tables(html_fragment: str) -> list[pd.DataFrame]:
@@ -237,10 +305,13 @@ def harvest_tables_from_html(html: str, base_url: str) -> list[pd.DataFrame]:
             pass
 
     out: list[pd.DataFrame] = []
-    for d in tables:
+    for ti, d in enumerate(tables):
         try:
+            if d is None or d.empty:
+                continue
             out.append(_normalize_columns(d))
-        except Exception:
+        except Exception as e:
+            _log.warning("표 #%s 정규화 스킵: %s", ti, e)
             continue
     return out
 
@@ -271,7 +342,14 @@ def parse_disclosure_for_accounts(
     if not collected:
         collected.extend(harvest_tables_from_html(main_html, main_url))
 
-    financial_like = [t for t in collected if _table_looks_financial(t)]
+    financial_like: list[pd.DataFrame] = []
+    for ti, t in enumerate(collected):
+        try:
+            if _table_looks_financial(t):
+                financial_like.append(t)
+        except Exception as e:
+            _log.warning("HTML 표 재무 판별 스킵 #%s: %s", ti, e)
+            continue
 
     title_hint = ""
     blob = main_html[:200_000]
@@ -324,7 +402,14 @@ def parse_tables_from_document_zip(zip_bytes: bytes) -> ParsedTableBundle:
             names_seen.append(name)
             collected.extend(harvest_tables_from_html(text, name))
 
-    financial_like = [t for t in collected if _table_looks_financial(t)]
+    financial_like = []
+    for ti, t in enumerate(collected):
+        try:
+            if _table_looks_financial(t):
+                financial_like.append(t)
+        except Exception as e:
+            _log.warning("ZIP 표 재무 판별 스킵 #%s: %s", ti, e)
+            continue
     tables = financial_like or collected
     hint = ",".join(names_seen[:3]) if names_seen else "zip"
     return ParsedTableBundle(
@@ -346,11 +431,16 @@ def bundle_to_account_amount_frame(bundle: ParsedTableBundle) -> pd.DataFrame:
                 continue
             long_df["_table_idx"] = i
             parts.append(long_df)
-        except Exception:
+        except Exception as e:
+            _log.warning("bundle 표 #%s longify 실패: %s", i, e)
             continue
     if not parts:
         return pd.DataFrame(columns=["account_nm", "amount_raw"])
-    return pd.concat(parts, ignore_index=True)
+    try:
+        return pd.concat(parts, ignore_index=True)
+    except Exception as e:
+        _log.warning("bundle concat 실패: %s", e)
+        return pd.DataFrame(columns=["account_nm", "amount_raw"])
 
 
 def parse_query_params(url: str) -> dict[str, list[str]]:

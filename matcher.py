@@ -6,10 +6,12 @@ rapidfuzz 기반으로 다국어·변형 표기를 흡수한다.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Any, Sequence
 
 import pandas as pd
 from rapidfuzz import fuzz, process
+
+from utils import safe_str
 
 
 @dataclass(frozen=True)
@@ -21,14 +23,23 @@ class AccountMatch:
     row_index: int
 
 
-def normalize_query(text: str) -> str:
+def normalize_query(text: Any) -> str:
     """비교 전 질의 정규화(공백 축소, 소문자)."""
-    return " ".join(text.strip().lower().split())
+    t = safe_str(text)
+    return " ".join(t.lower().split())
+
+
+def _expand_query_for_revenue_like(q: str) -> str:
+    """매출·수익·영업수익 등 동의어를 질의에 덧붙여 비상장 표기 변형에 대응한다."""
+    low = q.lower()
+    if any(k in low for k in ("매출", "수익", "영업수익", "revenue", "sales")):
+        return f"{q} 매출액 영업수익 수익 매출 revenue"
+    return q
 
 
 def best_account_match(
     query: str,
-    account_names: Sequence[str],
+    account_names: Sequence[Any],
     *,
     score_cutoff: float = 72.0,
     limit: int = 5,
@@ -36,26 +47,24 @@ def best_account_match(
     """
     질의 문자열과 가장 유사한 account_nm 상위 후보를 반환한다.
 
-    Parameters
-    ----------
-    query : str
-        사용자가 입력한 항목명 (예: 매출액, Revenue).
-    account_names : Sequence[str]
-        후보 계정명 목록.
-    score_cutoff : float
-        rapidfuzz partial_ratio 기준 최소 점수.
-    limit : int
-        반환할 최대 후보 개수.
+    account_names 에 float/NaN 이 섞여 있어도 안전하게 문자열로 변환한다.
     """
-    if not query.strip():
-        return []
-    choices = list(account_names)
-    if not choices:
+    if not safe_str(query):
         return []
 
-    q = normalize_query(query)
+    pairs: list[tuple[str, int]] = []
+    for i, raw in enumerate(account_names):
+        sc = safe_str(raw)
+        if sc:
+            pairs.append((sc, i))
+    if not pairs:
+        return []
 
-    # extract는 (choice, score, idx) 튜플 리스트
+    choices = [p[0] for p in pairs]
+    orig_idx = [p[1] for p in pairs]
+
+    q = _expand_query_for_revenue_like(normalize_query(query))
+
     results = process.extract(
         q,
         choices,
@@ -65,7 +74,8 @@ def best_account_match(
     )
     out: list[AccountMatch] = []
     for choice, score, idx in results:
-        out.append(AccountMatch(account_nm=str(choice), score=float(score), row_index=int(idx)))
+        row_i = orig_idx[int(idx)]
+        out.append(AccountMatch(account_nm=safe_str(choice), score=float(score), row_index=int(row_i)))
     return out
 
 
@@ -84,7 +94,7 @@ def attach_best_match_to_dataframe(
     """
     if df.empty or account_col not in df.columns:
         return None, []
-    names = df[account_col].astype(str).tolist()
+    names = [safe_str(x) for x in df[account_col].tolist()]
     candidates = best_account_match(query, names, score_cutoff=score_cutoff, limit=8)
     if not candidates:
         return None, []

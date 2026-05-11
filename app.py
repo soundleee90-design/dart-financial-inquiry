@@ -31,7 +31,7 @@ from dart_client import (
     load_api_key,
     search_corporations_from_df,
 )
-from matcher import AccountMatch, attach_best_match_to_dataframe, best_account_match
+from matcher import AccountMatch, attach_best_match_to_dataframe, best_account_match, top_account_hints
 from parser import bundle_to_account_amount_frame, parse_disclosure_for_accounts, parse_tables_from_document_zip
 from utils import (
     build_report_sentence,
@@ -74,6 +74,9 @@ class FinancialLookupResult:
     match_candidates: list[AccountMatch]
     # 예: 연결 선택인데 API는 별도만 있음, 비상장 원문 파싱 등
     basis_note: str | None = None
+    # 매칭 실패 시 디버그(화면 expander)
+    debug_top_accounts: list[str] | None = None
+    debug_ranked_hints: list[tuple[str, float]] | None = None
 
 
 def _init_session() -> None:
@@ -182,6 +185,10 @@ def _lookup_via_opendart(
     amt_col = _api_amount_column(df)
     matched_df, cands = attach_best_match_to_dataframe(df, item_query, account_col="account_nm")
     if matched_df is None or matched_df.empty:
+        acc_series = df["account_nm"].dropna().astype(str).str.strip()
+        acc_series = acc_series[acc_series.str.len() > 0]
+        preview = acc_series.unique().tolist()[:30]
+        hints = top_account_hints(item_query, df["account_nm"].tolist(), limit=30)
         return FinancialLookupResult(
             company_name=corp_name,
             corp_code=corp_code,
@@ -196,6 +203,8 @@ def _lookup_via_opendart(
             sentence="입력하신 항목과 유사한 계정명을 찾지 못했습니다. 표현을 바꿔 보세요.",
             match_candidates=cands,
             basis_note=merged_basis,
+            debug_top_accounts=preview,
+            debug_ranked_hints=hints,
         )
 
     row = matched_df.iloc[0].to_dict()
@@ -256,6 +265,11 @@ def _lookup_via_dart_html(
         raise DartApiError("해당 기간 OpenDART 공시 목록이 비어 있습니다. 사업연도·제출 시기를 확인하세요.")
 
     prefer_cons = fs_div.upper() == "CFS"
+    failure_trace: dict[str, Any] = {
+        "account_candidates": [],
+        "report_nm": "",
+        "rcept_no": "",
+    }
 
     def _try_rows(rows: Sequence[pd.Series], *, html_basis_note: str | None) -> FinancialLookupResult | None:
         for row in rows:
@@ -267,8 +281,13 @@ def _lookup_via_dart_html(
             from_attachment = False
             max_v = 88 if is_unlisted else 40
             try:
-                bundle = parse_disclosure_for_accounts(rcept_no, max_viewer_urls=max_v)
-                flat = bundle_to_account_amount_frame(bundle)
+                bundle = parse_disclosure_for_accounts(
+                    rcept_no,
+                    max_viewer_urls=max_v,
+                    bsns_year=str(bsns_year),
+                    include_all_html_tables=is_unlisted,
+                )
+                flat = bundle_to_account_amount_frame(bundle, bsns_year=str(bsns_year))
             except DartNetworkError:
                 flat = pd.DataFrame()
                 bundle = None  # type: ignore[assignment]
@@ -287,8 +306,8 @@ def _lookup_via_dart_html(
                     _dbg(f"첨부 원본 미수신 rcept_no={rcept_no}")
                 else:
                     try:
-                        bundle = parse_tables_from_document_zip(zbytes)
-                        flat = bundle_to_account_amount_frame(bundle)
+                        bundle = parse_tables_from_document_zip(zbytes, include_all_tables=is_unlisted)
+                        flat = bundle_to_account_amount_frame(bundle, bsns_year=str(bsns_year))
                         if flat.empty:
                             logger.warning(
                                 "첨부파일 분석 결과 표 없음 rcept_no=%s — 다음 후보로 진행",
@@ -314,7 +333,16 @@ def _lookup_via_dart_html(
 
             if flat.empty:
                 continue
-            cands = best_account_match(item_query, flat["account_nm"].tolist(), score_cutoff=58.0, limit=14)
+            acc_series = flat["account_nm"].dropna().astype(str).str.strip()
+            acc_series = acc_series[acc_series.str.len() > 0]
+            failure_trace["account_candidates"] = acc_series.unique().tolist()[:500]
+            failure_trace["report_nm"] = report_nm
+            failure_trace["rcept_no"] = rcept_no
+
+            match_cutoff = 52.0 if is_unlisted else 58.0
+            cands = best_account_match(
+                item_query, flat["account_nm"].tolist(), score_cutoff=match_cutoff, limit=14
+            )
             if not cands:
                 continue
             best = cands[0]
@@ -364,7 +392,7 @@ def _lookup_via_dart_html(
         return None
 
     rows1 = disclosure_parse_candidates(
-        discs, prefer_consolidated=prefer_cons, unlisted=is_unlisted, max_candidates=20
+        discs, prefer_consolidated=prefer_cons, unlisted=is_unlisted, max_candidates=28
     )
     hit = _try_rows(rows1, html_basis_note=None)
     if hit:
@@ -372,7 +400,7 @@ def _lookup_via_dart_html(
 
     if prefer_cons:
         rows2 = disclosure_parse_candidates(
-            discs, prefer_consolidated=False, unlisted=is_unlisted, max_candidates=20
+            discs, prefer_consolidated=False, unlisted=is_unlisted, max_candidates=28
         )
         hit = _try_rows(
             rows2,
@@ -383,7 +411,7 @@ def _lookup_via_dart_html(
 
     # 매칭만 되고 금액 파싱 실패한 경우 등: 마지막으로 매칭 실패 결과 반환
     rows0 = disclosure_parse_candidates(
-        discs, prefer_consolidated=False, unlisted=is_unlisted, max_candidates=5
+        discs, prefer_consolidated=False, unlisted=is_unlisted, max_candidates=12
     )
     for row in rows0:
         rcept_no = str(row.get("rcept_no", "")).strip()
@@ -391,8 +419,13 @@ def _lookup_via_dart_html(
         if not rcept_no:
             continue
         try:
-            bundle = parse_disclosure_for_accounts(rcept_no, max_viewer_urls=88 if is_unlisted else 40)
-            flat = bundle_to_account_amount_frame(bundle)
+            bundle = parse_disclosure_for_accounts(
+                rcept_no,
+                max_viewer_urls=88 if is_unlisted else 40,
+                bsns_year=str(bsns_year),
+                include_all_html_tables=is_unlisted,
+            )
+            flat = bundle_to_account_amount_frame(bundle, bsns_year=str(bsns_year))
         except DartNetworkError:
             flat = pd.DataFrame()
             bundle = None  # type: ignore[assignment]
@@ -405,8 +438,8 @@ def _lookup_via_dart_html(
             zbytes = try_fetch_disclosure_attachment_bytes(api_key, rcept_no)
             if zbytes:
                 try:
-                    bundle = parse_tables_from_document_zip(zbytes)
-                    flat = bundle_to_account_amount_frame(bundle)
+                    bundle = parse_tables_from_document_zip(zbytes, include_all_tables=is_unlisted)
+                    flat = bundle_to_account_amount_frame(bundle, bsns_year=str(bsns_year))
                 except Exception as e:  # noqa: BLE001
                     logger.warning("공시 %s 첨부 파싱 스킵(금액 미인식 루프): %s", rcept_no, e)
                     _dbg(f"[금액 미인식 루프] 첨부 파싱 예외 rcept_no={rcept_no}: {e!r}")
@@ -415,7 +448,12 @@ def _lookup_via_dart_html(
                 continue
         if flat.empty:
             continue
-        cands = best_account_match(item_query, flat["account_nm"].tolist(), score_cutoff=58.0, limit=14)
+        cands = best_account_match(
+            item_query,
+            flat["account_nm"].tolist(),
+            score_cutoff=52.0 if is_unlisted else 58.0,
+            limit=14,
+        )
         if not cands:
             continue
         return FinancialLookupResult(
@@ -438,7 +476,21 @@ def _lookup_via_dart_html(
         "상세: 해당 사업연도 사업보고서 미제출, PDF/스캔만 공시, 또는 표 추출 불가 공시일 수 있습니다. "
         "사업연도·DART 원문을 직접 확인하세요."
     )
-    raise DartApiError("DART 원문에서 해당 항목을 찾지 못했습니다.")
+    accts: list[str] = list(failure_trace.get("account_candidates") or [])[:30]
+    ranked = (
+        top_account_hints(item_query, failure_trace["account_candidates"], limit=30)
+        if failure_trace.get("account_candidates")
+        else []
+    )
+    raise DartApiError(
+        "DART 원문에서 해당 항목을 찾지 못했습니다.",
+        tech_detail={
+            "매칭_가능_후보_계정명": accts,
+            "유사도_상위_후보": ranked,
+            "선택된_공시명": failure_trace.get("report_nm") or "",
+            "선택된_rcept_no": failure_trace.get("rcept_no") or "",
+        },
+    )
 
 
 def run_lookup_pipeline(
@@ -525,7 +577,10 @@ def run_lookup_pipeline(
             progress=progress,
             debug_log=debug_log,
         )
-    except (DartApiError, DartNetworkError):
+    except (DartApiError, DartNetworkError) as e:
+        if debug_log is not None and isinstance(e, DartApiError) and getattr(e, "tech_detail", None):
+            debug_log.append("=== DART 원문 폴백 실패 상세 ===")
+            debug_log.append(json.dumps(e.tech_detail, ensure_ascii=False))
         if primary is not None:
             return primary
         raise
@@ -722,6 +777,10 @@ DART_API_KEY = "여기에_발급받은_키"
                     with st.expander("기술 상세 (개발자용)"):
                         if lookup_debug:
                             st.code("\n".join(lookup_debug), language="text")
+                        td = getattr(e, "tech_detail", None) or {}
+                        if td:
+                            st.markdown("**최종 시도 공시·계정 후보**")
+                            st.json(td)
                 except DartNetworkError:
                     status.update(label="네트워크 오류", state="error")
                     st.error("네트워크 연결을 확인한 뒤 잠시 후 다시 시도해 주세요.")
@@ -786,6 +845,24 @@ DART_API_KEY = "여기에_발급받은_키"
                     hide_index=True,
                     use_container_width=True,
                 )
+
+        if res.matched_account == "(매칭 실패)" and (
+            res.debug_ranked_hints or res.debug_top_accounts
+        ):
+            with st.expander("매칭 디버그 — 계정명 후보 상위 30"):
+                if res.debug_ranked_hints:
+                    st.dataframe(
+                        pd.DataFrame(res.debug_ranked_hints, columns=["계정명", "유사도"]),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                if res.debug_top_accounts:
+                    st.caption("API에서 내려온 계정명 일부")
+                    st.dataframe(
+                        pd.DataFrame({"account_nm": res.debug_top_accounts}),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
 
 
 if __name__ == "__main__":

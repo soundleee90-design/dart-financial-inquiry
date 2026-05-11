@@ -32,9 +32,16 @@ _PROJECT_DIR = Path(__file__).resolve().parent
 class DartApiError(Exception):
     """OpenDART API가 비정상 응답을 반환한 경우."""
 
-    def __init__(self, message: str, status: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status: str | None = None,
+        *,
+        tech_detail: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status = status
+        self.tech_detail = tech_detail or {}
 
 
 class DartNetworkError(Exception):
@@ -434,10 +441,11 @@ def disclosure_list_for_fiscal_year(
         raise DartApiError("DART_API_KEY가 설정되어 있지 않습니다.")
 
     y = int(str(bsns_year))
+    # 사업연도 N 재무는 접수일이 N+1~N+2년에 걸쳐 올라오므로 당기 1/1~익년 말까지 넓게 검색
     ranges: list[tuple[str, str]] = [
-        (f"{y + 1}0101", f"{y + 1}1231"),  # 익년 연간(일반적)
-        (f"{y}0701", f"{y + 1}1231"),  # 당기 하반기부터 익년까지(일부 법인)
-        (f"{y + 2}0101", f"{y + 2}0630"),  # 지연 제출(익익년 상반기)
+        (f"{y}0101", f"{y + 1}1231"),  # 예: 2025 사업연도 → 20250101~20261231
+        (f"{y + 1}0101", f"{y + 1}1231"),  # 익년만 (API 중복 제거로 합쳐짐)
+        (f"{y + 2}0101", f"{y + 2}0630"),  # 지연 제출
     ]
 
     parts: list[pd.DataFrame] = []
@@ -540,8 +548,7 @@ def disclosure_parse_candidates(
     """
     HTML 파싱에 시도할 공시 행을 우선순위대로 나열한다.
 
-    비상장은 감사보고서 본문에 표 형태 재무가 있는 경우가 많아,
-    `unlisted=True`이면 감사보고서를 사업보고서보다 앞에 둔다.
+    비상장은 연결감사·감사보고서·감사보고서제출·연결재무 등을 사업보고서보다 앞에 둔다.
     """
     if disclosures.empty or "report_nm" not in disclosures.columns or "rcept_no" not in disclosures.columns:
         return []
@@ -551,8 +558,7 @@ def disclosure_parse_candidates(
     seen: set[str] = set()
     ordered: list[pd.Series] = []
 
-    def push(mask: pd.Series) -> bool:
-        """True 이면 max 도달."""
+    def push(mask: pd.Series) -> None:
         sub = df.loc[mask & df["rcept_no"].astype(str).str.strip().str.len().gt(0)]
         for _, row in sub.iterrows():
             rid = str(row["rcept_no"]).strip()
@@ -560,37 +566,39 @@ def disclosure_parse_candidates(
                 continue
             seen.add(rid)
             ordered.append(row)
-            if len(ordered) >= max_candidates:
-                return True
-        return False
 
-    # 1) 연결 감사/재무 (상장·연결 요청 시)
-    if prefer_consolidated:
-        if push(names.str.contains("연결감사", na=False)):
-            return ordered
-        if push(names.str.contains("연결재무", na=False)):
-            return ordered
+    tiers: list[pd.Series] = []
 
-    # 2) 비상장: 단일 감사보고서 우선 (연결 제외)
     if unlisted:
-        if push(names.str.contains("감사보고서", na=False) & ~names.str.contains("연결", na=False)):
-            return ordered
-        if push(names.str.contains("감사보고서", na=False)):
-            return ordered
+        if prefer_consolidated:
+            tiers.append(names.str.contains("연결감사", na=False))
+        tiers.append(names.str.contains("감사보고서", na=False) & ~names.str.contains("연결", na=False))
+        tiers.append(names.str.contains("감사보고서제출", na=False))
+        if prefer_consolidated:
+            tiers.append(
+                names.str.contains("연결재무제표", na=False)
+                | (names.str.contains("연결", na=False) & names.str.contains("재무", na=False))
+            )
+        if not prefer_consolidated:
+            tiers.append(names.str.contains("연결감사", na=False))
+            tiers.append(names.str.contains("연결재무제표", na=False) | names.str.contains("연결재무", na=False))
+    else:
+        if prefer_consolidated:
+            tiers.append(names.str.contains("연결감사", na=False))
+            tiers.append(names.str.contains("연결재무제표", na=False) | names.str.contains("연결재무", na=False))
 
-    # 3) 사업보고서 (정정 제외 우선)
-    if push(names.str.contains("사업보고서", na=False) & ~names.str.contains("정정", na=False)):
-        return ordered
-    if push(names.str.contains("재무제표", na=False)):
-        return ordered
-    if push(names.str.contains("사업보고서", na=False)):
-        return ordered
+    tiers.append(names.str.contains("사업보고서", na=False) & ~names.str.contains("정정", na=False))
+    tiers.append(names.str.contains("재무제표", na=False) & ~names.str.contains("감사보고서", na=False))
+    tiers.append(names.str.contains("사업보고서", na=False))
 
-    if not prefer_consolidated and not unlisted:
-        if push(names.str.contains("감사보고서", na=False) & ~names.str.contains("연결", na=False)):
-            return ordered
+    if not unlisted:
+        tiers.append(names.str.contains("감사보고서", na=False) & ~names.str.contains("연결", na=False))
 
-    # 4) 나머지 최신 공시로 채움
+    for mask in tiers:
+        push(mask)
+        if len(ordered) >= max_candidates:
+            return ordered[:max_candidates]
+
     for _, row in df.iterrows():
         rid = str(row.get("rcept_no", "")).strip()
         if not rid or rid in seen:
@@ -600,7 +608,7 @@ def disclosure_parse_candidates(
         if len(ordered) >= max_candidates:
             break
 
-    return ordered
+    return ordered[:max_candidates]
 
 
 def pick_business_report_row(disclosures: pd.DataFrame, prefer_consolidated: bool) -> pd.Series | None:

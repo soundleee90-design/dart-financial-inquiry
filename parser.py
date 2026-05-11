@@ -160,6 +160,28 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
 
+def _income_statement_rank(df: pd.DataFrame) -> int:
+    """손익계산서 류 표를 앞쪽으로 정렬하기 위한 순위 (작을수록 우선)."""
+    parts: list[str] = [safe_str(c) for c in df.columns]
+    try:
+        for _, row in df.head(6).iterrows():
+            for v in row.values:
+                parts.append(safe_str(v))
+    except Exception:
+        pass
+    blob = " ".join(parts)
+    compact = re.sub(r"\s+", "", blob)
+    if "연결포괄손익계산서" in compact or "연결포괄손익" in compact:
+        return 0
+    if "연결손익계산서" in compact:
+        return 1
+    if "포괄손익계산서" in blob:
+        return 2
+    if "손익계산서" in blob and "재무상태표" not in blob[:120]:
+        return 4
+    return 25
+
+
 def _column_digit_ratio(series: pd.Series, sample: int = 50) -> float:
     """열 값에 숫자(금액) 형태가 얼마나 등장하는지 0~1."""
     pat = re.compile(r"[\d,\.\(\)]+")
@@ -176,7 +198,11 @@ def _column_digit_ratio(series: pd.Series, sample: int = 50) -> float:
     return hits / max(n, 1)
 
 
-def _pick_account_and_amount_columns(df: pd.DataFrame) -> tuple[str, str] | None:
+def _pick_account_and_amount_columns(
+    df: pd.DataFrame,
+    *,
+    bsns_year: str | None = None,
+) -> tuple[str, str] | None:
     """
     첫 열·금액 열을 추론한다. 비상장 표는 '당기'·'제n기' 등 열 이름이 제각각이다.
     """
@@ -186,6 +212,9 @@ def _pick_account_and_amount_columns(df: pd.DataFrame) -> tuple[str, str] | None
             return None
 
         cols = list(df.columns)
+        y_hint = ""
+        if bsns_year and str(bsns_year).strip().isdigit():
+            y_hint = str(int(str(bsns_year).strip()))
 
         # 금액 후보 열: 이름 힌트 또는 숫자 비율
         best_col = cols[-1]
@@ -193,8 +222,16 @@ def _pick_account_and_amount_columns(df: pd.DataFrame) -> tuple[str, str] | None
         for j, c in enumerate(cols):
             cs = safe_str(c)
             hint = 0.0
-            if any(k in cs for k in ("당기", "금액", "합계", "기간", "제", "분기", "반기")):
+            if any(k in cs for k in ("당기", "금액", "합계", "기간", "분기", "반기")):
                 hint = 2.0
+            if "제" in cs and "기" in cs:
+                hint += 2.5
+            if y_hint and y_hint in cs:
+                hint += 4.0
+            if y_hint and (f"{y_hint}.12.31" in cs or f"{y_hint}년" in cs or f"{y_hint}.6.30" in cs):
+                hint += 4.5
+            if re.search(r"제\s*\d+\s*기", cs):
+                hint += 3.0
             ratio = _column_digit_ratio(df[c])
             score = hint + ratio * 3.0 + (0.1 * j / max(len(cols), 1))  # 동점이면 오른쪽 선호
             if score > best_score:
@@ -267,12 +304,12 @@ def _table_looks_financial(df: pd.DataFrame) -> bool:
     return False
 
 
-def _longify_financial_table(df: pd.DataFrame) -> pd.DataFrame:
+def _longify_financial_table(df: pd.DataFrame, *, bsns_year: str | None = None) -> pd.DataFrame:
     """
     다양한 형태의 공시 표를 (account_nm, amount_raw) 형태로 단순화 시도한다.
     """
     try:
-        picked = _pick_account_and_amount_columns(df)
+        picked = _pick_account_and_amount_columns(df, bsns_year=bsns_year)
         if picked is None:
             return pd.DataFrame(columns=["account_nm", "amount_raw"])
         account_col, value_col = picked
@@ -389,8 +426,18 @@ def harvest_tables_from_html(html: str, base_url: str) -> list[pd.DataFrame]:
 def parse_disclosure_for_accounts(
     rcp_no: str,
     *,
-    prefer_keywords: Iterable[str] = ("연결손익", "연결재무상태", "손익계산서", "재무상태표", "포괄손익"),
+    prefer_keywords: Iterable[str] = (
+        "연결 포괄손익계산서",
+        "연결포괄손익",
+        "연결손익",
+        "연결재무상태",
+        "포괄손익계산서",
+        "손익계산서",
+        "재무상태표",
+    ),
     max_viewer_urls: int = 40,
+    bsns_year: str | None = None,
+    include_all_html_tables: bool = False,
 ) -> ParsedTableBundle:
     """
     공시 접수번호(rcp_no) 기준으로 DART 본문을 따라가며 재무표 후보를 수집한다.
@@ -418,6 +465,8 @@ def parse_disclosure_for_accounts(
         # 본문 main.do 에만 있는 표(뷰어 URL 누락·비상장 멀티첨부 대비)
         collected.extend(main_tables)
 
+    collected.sort(key=lambda t: (_income_statement_rank(t), -(t.shape[0] * max(t.shape[1], 1))))
+
     financial_like: list[pd.DataFrame] = []
     for ti, t in enumerate(collected):
         try:
@@ -433,15 +482,26 @@ def parse_disclosure_for_accounts(
         if kw in blob:
             title_hint = kw
             break
+    if not title_hint and bsns_year:
+        for kw in (f"{bsns_year}년", str(bsns_year)):
+            if kw in blob:
+                title_hint = kw
+                break
+
+    tables_out = collected if include_all_html_tables else (financial_like or collected)
 
     return ParsedTableBundle(
         source_url=used_url,
         disclosure_title_hint=title_hint,
-        tables=financial_like or collected,
+        tables=tables_out,
     )
 
 
-def parse_tables_from_document_zip(zip_bytes: bytes) -> ParsedTableBundle:
+def parse_tables_from_document_zip(
+    zip_bytes: bytes,
+    *,
+    include_all_tables: bool = False,
+) -> ParsedTableBundle:
     """
     공시 첨부 원본(ZIP) 안의 HTML/XML 에서 표를 추출한다.
 
@@ -523,6 +583,9 @@ def parse_tables_from_document_zip(zip_bytes: bytes) -> ParsedTableBundle:
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
 
+    if collected:
+        collected.sort(key=lambda t: (_income_statement_rank(t), -(t.shape[0] * max(t.shape[1], 1))))
+
     financial_like: list[pd.DataFrame] = []
     for ti, t in enumerate(collected):
         try:
@@ -531,7 +594,7 @@ def parse_tables_from_document_zip(zip_bytes: bytes) -> ParsedTableBundle:
         except Exception as e:
             _log.warning("첨부 표 재무 판별 스킵 #%s: %s", ti, e)
             continue
-    tables = financial_like or collected
+    tables = collected if include_all_tables else (financial_like or collected)
     hint = ",".join(names_seen[:3]) if names_seen else "attachment"
     return ParsedTableBundle(
         source_url=f"공시 첨부 원본 ({hint})",
@@ -540,14 +603,18 @@ def parse_tables_from_document_zip(zip_bytes: bytes) -> ParsedTableBundle:
     )
 
 
-def bundle_to_account_amount_frame(bundle: ParsedTableBundle) -> pd.DataFrame:
+def bundle_to_account_amount_frame(
+    bundle: ParsedTableBundle,
+    *,
+    bsns_year: str | None = None,
+) -> pd.DataFrame:
     """
     ParsedTableBundle의 여러 표를 하나의 장표 DataFrame으로 병합한다.
     """
     parts: list[pd.DataFrame] = []
     for i, t in enumerate(bundle.tables):
         try:
-            long_df = _longify_financial_table(t)
+            long_df = _longify_financial_table(t, bsns_year=bsns_year)
             if long_df.empty:
                 continue
             long_df["_table_idx"] = i
